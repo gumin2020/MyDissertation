@@ -92,7 +92,7 @@ class _BayesianNetG(nn.Module):
         kl = 0
         for layer in self.layers:
             if hasattr(layer, 'convprobforward') and callable(layer.convprobforward):
-                x = F.interpolate(x, scale_factor=2, mode="bilinear")
+                x = F.interpolate(x, scale_factor=2, mode="bilinear",align_corners=False)
                 x, _kl, = layer.convprobforward(x)
                 #x = F.leaky_relu(x,negative_slope=0.2)
                 kl += _kl

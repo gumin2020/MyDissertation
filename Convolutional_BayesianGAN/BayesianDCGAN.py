@@ -36,6 +36,7 @@ import torch.nn as nn
 import torch.nn.parallel
 import torch.backends.cudnn as cudnn
 import torch.optim as optim
+import torch.nn.functional as F
 import torch.utils.data
 import torchvision.datasets as dset
 import torchvision.transforms as transforms
@@ -99,6 +100,7 @@ transform_opt = transforms.Compose([
     normalize,
 ])
 # get training set and test set
+# train=True by default so don't panic
 dataset = dset.CIFAR10(root="./cifar10", download=True,
                        transform=transform_opt)
 dataloader = torch.utils.data.DataLoader(dataset, batch_size=opt.batchSize,
@@ -219,10 +221,11 @@ def get_test_accuracy(model_d, iteration, label='semi'):
     # don't forget to do model_d.eval() before doing evaluation
     top1 = AverageMeter()
     for i, (input, target) in enumerate(dataloader_test):
+        torch.no_grad()
         target = target.cuda()
         input = input.cuda()
-        input_var = torch.autograd.Variable(input.cuda(), volatile=True)
-        target_var = torch.autograd.Variable(target, volatile=True)
+        input_var = torch.autograd.Variable(input.cuda())
+        target_var = torch.autograd.Variable(target)
         output = model_d(input_var)[0]
 
         probs = output.data[:, 1:]  # discard the zeroth index
@@ -235,8 +238,23 @@ def get_test_accuracy(model_d, iteration, label='semi'):
     print('{label} Test Prec@1 {top1.avg:.2f}'.format(label=label, top1=top1))
     log_value('test_acc_{}'.format(label), top1.avg, iteration)
 
-#the training part
+# define the ELBO producing function
+
+
+def elbo(out, y, kl, beta):
+    loss = F.cross_entropy(out, y)
+    return loss + beta * kl
+
+# the get_beta function
+
+
+def get_beta(epoch_idx, N):
+    return 1.0 / N / 100
+
+
+# --- the training part ---
 iteration = 0
+torch.autograd.set_detect_anomaly(True)
 for epoch in range(opt.niter):
     top1 = AverageMeter()
     top1_weakD = AverageMeter()
@@ -254,12 +272,19 @@ for epoch in range(opt.niter):
         inputv = Variable(input)
         labelv = Variable(label)
 
-        output = netD(inputv)[0]  # used to have no [0] index
-        print(output)
-        errD_real = criterion_comp(output)
+        output, kl = netD(inputv)
+        #errD_real = criterion_comp(output)
+        # errD_real.backward()
+
+        # --- the backprop for bayesian conv ---
+        label = label.type(torch.LongTensor)
+        label = label.cuda()
+        errD_real = elbo(output, label, kl, get_beta(epoch, len(dataset)))
+        #print(errD_real)
+
         errD_real.backward()
         # calculate D_x, the probability that real data are classified
-        D_x = 1 - torch.nn.functional.softmax(output).data[:, 0].mean()
+        D_x = 1 - torch.nn.functional.softmax(output,dim=1).data[:, 0].mean()
 
         #######
         # 2. Generated input
@@ -273,13 +298,16 @@ for epoch in range(opt.niter):
                 _fake = netG(noisev)[0]
                 fakes.append(_fake)
         fake = torch.cat(fakes)
-        output = netD(fake.detach())[0]  # used to have no [0] index
+        output, kl = netD(fake.detach())
         labelv = Variable(torch.LongTensor(
             fake.data.shape[0]).cuda().fill_(fake_label))
-        errD_fake = criterion(output, labelv)
-        errD_fake.backward()
+        #errD_fake = criterion(output, labelv)
+        # errD_fake.backward()
 
-        D_G_z1 = 1 - torch.nn.functional.softmax(output).data[:, 0].mean()
+        # --- the backprop for bayesian conv ---
+        errD_fake = elbo(output, labelv, kl, get_beta(epoch, len(dataset)))
+        errD_fake.backward()
+        D_G_z1 = 1 - torch.nn.functional.softmax(output,dim=1).data[:, 0].mean()
 
         #######
         # 3. Labeled Data Part (for semi-supervised learning)
@@ -289,8 +317,11 @@ for epoch in range(opt.niter):
         input_sup_v = Variable(input_sup.cuda())
         # convert target indicies from 0 to 9 to 1 to 10
         target_sup_v = Variable((target_sup + 1).cuda())
-        output_sup = netD(input_sup_v)[0]  # used to have no [0] index
-        err_sup = criterion(output_sup, target_sup_v)
+        output_sup, kl_sup = netD(input_sup_v)
+        #err_sup = criterion(output_sup, target_sup_v)
+        # --- the backprop for bayesian conv ---
+        err_sup = elbo(output_sup, target_sup_v, kl_sup,
+                       get_beta(epoch, len(dataset)))
         err_sup.backward()
         prec1 = accuracy(output_sup.data, target_sup + 1, topk=(1,))[0]
         #top1.update(prec1[0], input_sup.size(0))
@@ -308,16 +339,18 @@ for epoch in range(opt.niter):
         # 4. Generator
         for netG in netGs:
             netG.zero_grad()
-        labelv = Variable(torch.FloatTensor(
+        labelv = Variable(torch.LongTensor(
             fake.data.shape[0]).cuda().fill_(real_label))
-        output = netD(fake)[0]
-        errG = criterion_comp(output)
+        output, kl = netD(fake)
+        #errG = criterion_comp(output)
+        #print(labelv) #the out put is all 1, not sure why in the original code they put it in a float tensor.
+        errG = elbo(output, labelv, kl, get_beta(epoch, len(dataset)))
         if opt.bayes:
             for netG in netGs:
                 errG += gprior_criterion(netG.parameters())
                 errG += gnoise_criterion(netG.parameters())
         errG.backward()
-        D_G_z2 = 1 - torch.nn.functional.softmax(output).data[:, 0].mean()
+        D_G_z2 = 1 - torch.nn.functional.softmax(output,1).data[:, 0].mean()
         for optimizerG in optimizerGs:
             optimizerG.step()
 
@@ -325,9 +358,12 @@ for epoch in range(opt.niter):
         netD_fullsup.zero_grad()
         input_fullsup = Variable(input_sup)
         target_fullsup = Variable((target_sup + 1))
-        output_fullsup = netD_fullsup(input_fullsup)[
-            0]  # used to have no [0] index
-        err_fullsup = criterion_fullsup(output_fullsup, target_fullsup)
+        output_fullsup, kl_fullsup = netD_fullsup(input_fullsup)
+        #err_fullsup = criterion_fullsup(output_fullsup, target_fullsup)
+        # --- the backprop for bayesian conv ---
+        err_fullsup = elbo(output_fullsup, target_fullsup,
+                           kl_fullsup, get_beta(epoch, len(dataset)))
+
         optimizerD_fullsup.zero_grad()
         err_fullsup.backward()
         optimizerD_fullsup.step()

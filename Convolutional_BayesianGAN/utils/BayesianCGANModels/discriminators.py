@@ -43,7 +43,7 @@ class _netD(nn.Module):
             output = nn.parallel.data_parallel(self.main, input, range(self.ngpu))
         else:
             output = self.main(input)
-        print(input.shape)
+        #print(input.shape)
         return output.view(input.size(0), self.num_classes).squeeze(1)
 
 class _BayesianLeNetD(nn.Module):
