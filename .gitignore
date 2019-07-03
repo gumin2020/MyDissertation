@@ -1,2 +1,4 @@
 cifar10/
 modelfiles/
+
+__pycache__/
