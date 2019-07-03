@@ -1,4 +1,8 @@
 cifar10/
 modelfiles/
 __pycache__/
+Convolutional_BayesianGAN/modelfiles/
+Convolutional_BayesianGAN/checkpoint/
+Convolutional_BayesianGAN/utils/__pycache__/
+Convolutional_BayesianGAN/utils/BayesianCGANModels/__pycache__/
 *.pyc
