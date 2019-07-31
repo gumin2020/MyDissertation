@@ -1,12 +1,8 @@
-from utils.BayesianCGANModels.generators import _BayesianNetG, _netG
-from utils.BayesianCGANModels.discriminators import _BayesianLeNetD, _ClassifierD, _BayesianAlexNetD , _netD
+from utils.BayesianCGANModels.generators import _netG
+from utils.BayesianCGANModels.discriminators import _BayesianAlexNetD 
 import sys
 import pandas as pd
-from tensorboard.backend.event_processing import event_accumulator
-from utils.BayesianCGANModels.bayes import NoiseLoss, PriorLoss
-from utils.BayesianCGANModels.distributions import Normal
 from ComplementCrossEntropyLoss import ComplementCrossEntropyLoss
-from statsutil import weights_init
 from partial_dataset import PartialDataset
 import os
 import pickle
@@ -76,26 +72,20 @@ try:
 except Exception as e:
     print(str(e), opt.outf)
 
-# First, we construct the data loader for full training set
-# as well as the data loader of a partial training set for semi-supervised learning
-# transformation operator
+
 normalize = transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))
 transform_opt = transforms.Compose([
     transforms.ToTensor(),
     normalize,
 ])
-# get training set and test set
-# train=True by default so don't panic
 dataset = dset.CIFAR10(root="./cifar10", download=True,
                        transform=transform_opt)
 dataloader = torch.utils.data.DataLoader(dataset, batch_size=opt.batchSize,
                                          shuffle=True, num_workers=0)
 
-# partial dataset for semi-supervised training
 dataset_partial = PartialDataset(dataset, opt.num_semi)
 
 
-# test set for evaluation
 dataset_test = dset.CIFAR10(root="./cifar10",
                             train=False,
                             transform=transform_opt)
@@ -106,39 +96,12 @@ dataloader_semi = torch.utils.data.DataLoader(dataset_partial, batch_size=opt.ba
                                               shuffle=True, num_workers=0)
 
 
-# Now we initialize the distributions of G and D
-##### Generator ######
-# opt.num_mcmc is the number of MCMC chains that we run in parallel
-# opt.numz is the number of noise batches that we use. We also use different parameter samples for different batches
-# we construct opt.numz * opt.num_mcmc initial generator parameters
-# We will keep sampling parameters from the posterior starting from this set
-# Keeping track of many MCMC chains can be done quite elegantly in Pytorch
+netG = _netG(ngpu=opt.ngpu, nz=opt.nz)
 
-if opt.is_bayesian_generator == True:
-    netG = _BayesianNetG(noize=opt.nz)
-else:
-    netG = _netG(ngpu=opt.ngpu, nz=opt.nz)
-
-##### Discriminator ######
-# We will use 1 chain of MCMCs for the discriminator
-# The number of classes for semi-supervised case is 11; that is,
-# index 0 for fake data and 1-10 for the 10 classes of CIFAR.
 num_classes = 11
-#netD = _netD(opt.ngpu, num_classes=num_classes)
-#netD = _BayesianLeNetD(num_classes, 3)
 netD = _BayesianAlexNetD(num_classes, 3)
 
-# In order to calculate errG or errD_real, we need to sum the probabilities over all the classes (1 to K)
-# ComplementCrossEntropyLoss is a loss function that performs this task
-# We can specify a default except_index that corresponds to a fake label. In this case, we use index=0
-criterion = nn.CrossEntropyLoss()
-# use the default index = 0 - equivalent to summing all other probabilities
-criterion_comp = ComplementCrossEntropyLoss(except_index=0)
 
-
-# Finally, initialize the ``optimizers''
-# Since we keep track of a set of parameters, we also need a set of
-# ``optimizers''
 if opt.d_optim == 'adam':
     optimizerD = optim.Adam(netD.parameters(), lr=opt.lr, betas=(0.5, 0.999))
 elif opt.d_optim == 'sgd':
@@ -153,69 +116,9 @@ fixed_noise = torch.FloatTensor(
     opt.batchSize, opt.nz, 1, 1).normal_(0, 1).cuda()
 fixed_noise = Variable(fixed_noise)
 
-# initialize input variables and use CUDA (optional)
-input = torch.FloatTensor(opt.batchSize, 3, opt.imageSize, opt.imageSize)
-noise = torch.FloatTensor(opt.batchSize, opt.nz, 1, 1)
-label = torch.FloatTensor(opt.batchSize)
-real_label = 1
-fake_label = 0
-
 if opt.cuda:
     netD.cuda()
     netG.cuda()
-    criterion.cuda()
-    criterion_comp.cuda()
-    input, label = input.cuda(), label.cuda()
-    noise = noise.cuda()
-
-
-# fully supervised
-netD_fullsup = _BayesianLeNetD(num_classes, 3)
-#netD_fullsup = _netD(opt.ngpu, num_classes=num_classes)
-# netD_fullsup.apply(weights_init)  #was not commented out
-criterion_fullsup = nn.CrossEntropyLoss()
-if opt.d_optim == 'adam':
-    optimizerD_fullsup = optim.Adam(
-        netD_fullsup.parameters(), lr=opt.lr, betas=(0.5, 0.999))
-else:
-    optimizerD_fullsup = optim.SGD(netD_fullsup.parameters(), lr=opt.lr,
-                                   momentum=0.9,
-                                   nesterov=True,
-                                   weight_decay=1e-4)
-if opt.cuda:
-    netD_fullsup.cuda()
-    criterion_fullsup.cuda()
-
-# The classifier discriminator
-netD_class = _ClassifierD(num_classes, 3)
-if opt.d_optim == 'adam':
-    optimizerD_class = optim.Adam(
-        netD_class.parameters(), lr=opt.lr, betas=(0.5, 0.999))
-if opt.cuda:
-    netD_class.cuda()
-
-# We define a class to calculate the accuracy on test set
-# to test the performance of semi-supervised training
-def get_test_accuracy(model_d, iteration, label='semi'):
-    # don't forget to do model_d.eval() before doing evaluation
-    top1 = AverageMeter()
-    for i, (input, target) in enumerate(dataloader_test):
-        torch.no_grad()
-        target = target.cuda()
-        input = input.cuda()
-        input_var = torch.autograd.Variable(input.cuda())
-        target_var = torch.autograd.Variable(target)
-        output = model_d(input_var)[0]
-
-        probs = output.data[:, 1:]  # discard the zeroth index
-        prec1 = accuracy(probs, target, topk=(1,))[0]
-        #top1.update(prec1[0], input.size(0))
-        top1.update(prec1, input.size(0))
-        if i % 50 == 0:
-            print("{} Test: [{}/{}]\t Prec@1 {top1.val:.3f} ({top1.avg:.3f})".format(
-                label, i, len(dataloader_test), top1=top1))
-    print('{label} Test Prec@1 {top1.avg:.2f}'.format(label=label, top1=top1))
-    log_value('test_acc_{}'.format(label), top1.avg, iteration)
 
 # define the normal ELBO producing function
 def elbo(out, y, kl, beta):
@@ -227,7 +130,7 @@ def elbo(out, y, kl, beta):
 
 # the get_beta function
 def get_beta(epoch_idx, N):
-    return 1.0 / N / 100
+    return 1.0 / N
 
 def BayesianCNN_debug():
     Input = torch.FloatTensor(opt.batchSize, 3, opt.imageSize, opt.imageSize).cuda()
