@@ -68,7 +68,7 @@ parser.add_argument('--debug', type=bool, default=False, help='debug')
 parser.add_argument('--Legacy', type=bool, default=False, help='legacy code')
 parser.add_argument('--BayesianCNN_debug', type=bool, default=True, help='normal loss')
 sys.argv = ['']
-reload(sys)
+#reload(sys)
 opt = parser.parse_args()
 try:
     os.makedirs(opt.outf)
