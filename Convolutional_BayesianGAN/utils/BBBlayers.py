@@ -29,6 +29,7 @@ class BBBConv2d(nn.Module):
         self.reset_parameters()
 
     def reset_parameters(self):
+        #print("triggered")
         n = self.in_channels
         n *= self.kernel_size ** 2
         stdv = 1.0 / math.sqrt(n)

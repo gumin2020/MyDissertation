@@ -2,8 +2,33 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from utils.BBBlayers import BBBConv2d, BBBLinearFactorial, FlattenLayer
+import numpy as np
 
 import math
+
+class DebugNetG(nn.Module):
+    def __init__(self):
+        super(DebugNetG, self,).__init__()
+
+        def block(in_feat, out_feat, normalize=True):
+            layers = [nn.Linear(in_feat, out_feat)]
+            if normalize:
+                layers.append(nn.BatchNorm1d(out_feat, 0.8))
+            layers.append(nn.LeakyReLU(0.2, inplace=True))
+            return layers
+
+        self.model = nn.Sequential(block(100, 128, normalize=False),\
+		block(128, 256),\
+		block(256, 512),\
+		block(512, 1024),\
+		nn.Linear(1024, 32*32),\
+		nn.Tanh()\
+        )
+
+    def forward(self, z):
+        img = self.model(z.view(z.size(0), 100))
+        img = img.view(64,3,32,32)
+        return img
 
 class _netG(nn.Module):#not changed, kept as a comparation.
     def __init__(self, ngpu, nz=100, ngf=64, nc=3, batch_norm_layers=[], affine=True):
@@ -59,10 +84,8 @@ class _BayesianNetG(nn.Module):
 
         self.conv1 = BBBConv2d(self.q_logvar_init, self.p_logvar_init, noize, 128, kernel_size=3, stride=1, padding=1)
         self.soft = nn.Softplus()
-        #self.pool1 = nn.MaxPool2d(kernel_size=2, stride=2)
 
         self.conv2 = BBBConv2d(self.q_logvar_init, self.p_logvar_init,128, 64, kernel_size=3, stride=1, padding=1)
-        #self.pool2 = nn.MaxPool2d(kernel_size=2, stride=2)
 
         self.conv3 = BBBConv2d(self.q_logvar_init, self.p_logvar_init,64, 32,  kernel_size=3, stride=1, padding=1)
 
@@ -71,18 +94,6 @@ class _BayesianNetG(nn.Module):
 
         self.conv5 = BBBConv2d(self.q_logvar_init, self.p_logvar_init,16, 3,  kernel_size=3, stride=1, padding=1)
 
-        '''self.flatten = FlattenLayer(5 * 5 * 16)
-        self.fc1 = BBBLinearFactorial(5 * 5 * 16, 120)
-        self.soft3 = nn.Softplus()
-
-        self.fc2 = BBBLinearFactorial(120, 84)
-        self.soft4 = nn.Softplus()
-
-        self.fc3 = BBBLinearFactorial(84, outputs)'''
-
-        '''layers = [self.conv1, self.soft1, self.pool1, self.conv2, self.soft2, self.pool2,
-                  self.flatten, self.fc1, self.soft3, self.fc2, self.soft4, self.fc3]'''
-        
         layers = [self.conv1,self.soft,self.conv2,self.soft,self.conv3,self.soft,self.conv4,self.soft,self.conv5,self.soft]
 
         self.layers = nn.ModuleList(layers)
@@ -94,9 +105,9 @@ class _BayesianNetG(nn.Module):
             if hasattr(layer, 'convprobforward') and callable(layer.convprobforward):
                 x = F.interpolate(x, scale_factor=2, mode="bilinear",align_corners=False)
                 x, _kl, = layer.convprobforward(x)
-                #x = F.leaky_relu(x,negative_slope=0.2)
                 kl += _kl
             else:
                 x = layer(x)
         logits = x
+        #print(logits)
         return logits, kl
