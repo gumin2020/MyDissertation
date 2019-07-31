@@ -54,7 +54,7 @@ parser.add_argument('--batchSize', type=int,
                     default=64, help='input batch size')
 parser.add_argument('--nz', type=int, default=100,
                     help='size of the latent z vector')
-parser.add_argument('--niter', type=int, default=2,
+parser.add_argument('--niter', type=int, default=15,
                     help='number of epochs to train for')
 parser.add_argument('--lr', type=float, default=0.0002,
                     help='learning rate, default=0.0002')
@@ -65,10 +65,8 @@ parser.add_argument('--outf', default='modelfiles/pytorch_demo3',
                     help='folder to output images and model checkpoints')
 parser.add_argument('--numz', type=int, default=1,
                     help='The number of set of z to marginalize over.')
-parser.add_argument('--num_mcmc', type=int, default=10,
-                    help='The number of MCMC chains to run in parallel')
-parser.add_argument('--num_semi', type=int, default=4000,
-                    help='The number of semi-supervised samples')
+#parser.add_argument('--num_mcmc', type=int, default=10,help='The number of MCMC chains to run in parallel')
+parser.add_argument('--num_semi', type=int, default=4000,help='The number of semi-supervised samples')
 parser.add_argument('--gnoise_alpha', type=float, default=0.0001, help='')
 parser.add_argument('--dnoise_alpha', type=float, default=0.0001, help='')
 parser.add_argument('--d_optim', type=str, default='adam',
@@ -80,14 +78,16 @@ parser.add_argument('--stats_interval', type=int, default=10,
 parser.add_argument('--tensorboard', type=int, default=1, help='')
 parser.add_argument('--bayes', type=int, default=1,
                     help='Do Bayesian GAN or normal GAN')
+
+parser.add_argument('--semi_supervised_boost', type=bool,
+                    default=False, help='whether use semi or not')
 sys.argv = ['']
 del sys
 opt = parser.parse_args()
 try:
     os.makedirs(opt.outf)
-except OSError:
-    print("Error Making Directory", opt.outf)
-    pass
+except Exception as e:
+    print(str(e), opt.outf)
 if opt.tensorboard:
     configure(opt.outf)
 
@@ -128,12 +128,14 @@ dataloader_semi = torch.utils.data.DataLoader(dataset_partial, batch_size=opt.ba
 # we construct opt.numz * opt.num_mcmc initial generator parameters
 # We will keep sampling parameters from the posterior starting from this set
 # Keeping track of many MCMC chains can be done quite elegantly in Pytorch
-netGs = []
+
+#netGs = []
 for _idxz in range(opt.numz):
-    for _idxm in range(opt.num_mcmc):
+    netG = _BayesianNetG(noize=opt.nz)
+    '''for _idxm in range(opt.num_mcmc):
         netG = _BayesianNetG(noize=opt.nz)
         # netG.apply(weights_init)
-        netGs.append(netG)
+        netGs.append(netG)'''
 
 ##### Discriminator ######
 # We will use 1 chain of MCMCs for the discriminator
@@ -161,18 +163,20 @@ elif opt.d_optim == 'sgd':
                                  momentum=0.9,
                                  nesterov=True,
                                  weight_decay=1e-4)
-optimizerGs = []
-for netG in netGs:
+#optimizerGs = []
+optimizerG = optim.Adam(netG.parameters(), lr=opt.lr, betas=(0.5, 0.999))
+'''for netG in netGs:
     optimizerG = optim.Adam(netG.parameters(), lr=opt.lr, betas=(0.5, 0.999))
-    optimizerGs.append(optimizerG)
+    optimizerGs.append(optimizerG)'''
 
+'''
 # since the log posterior is the average per sample, we also scale down the prior and the noise
 gprior_criterion = PriorLoss(prior_std=1., observed=1000.)
 gnoise_criterion = NoiseLoss(params=netGs[0].parameters(
 ), scale=math.sqrt(2*opt.gnoise_alpha/opt.lr), observed=1000.)
 dprior_criterion = PriorLoss(prior_std=1., observed=50000.)
 dnoise_criterion = NoiseLoss(params=netD.parameters(), scale=math.sqrt(
-    2*opt.dnoise_alpha*opt.lr), observed=50000.)
+    2*opt.dnoise_alpha*opt.lr), observed=50000.)'''
 
 
 # Fixed noise for data generation
@@ -189,8 +193,9 @@ fake_label = 0
 
 if opt.cuda:
     netD.cuda()
-    for netG in netGs:
-        netG.cuda()
+    netG.cuda()
+    '''for netG in netGs:
+        netG.cuda()'''
     criterion.cuda()
     criterion_comp.cuda()
     input, label = input.cuda(), label.cuda()
@@ -239,15 +244,11 @@ def get_test_accuracy(model_d, iteration, label='semi'):
     log_value('test_acc_{}'.format(label), top1.avg, iteration)
 
 # define the ELBO producing function
-
-
 def elbo(out, y, kl, beta):
     loss = F.cross_entropy(out, y)
     return loss + beta * kl
 
 # the get_beta function
-
-
 def get_beta(epoch_idx, N):
     return 1.0 / N / 100
 
@@ -273,6 +274,7 @@ for epoch in range(opt.niter):
         labelv = Variable(label)
 
         output, kl = netD(inputv)
+        #print(inputv.shape,'/n'+'*******************', output.shape,labelv)
         #errD_real = criterion_comp(output)
         # errD_real.backward()
 
@@ -280,11 +282,11 @@ for epoch in range(opt.niter):
         label = label.type(torch.LongTensor)
         label = label.cuda()
         errD_real = elbo(output, label, kl, get_beta(epoch, len(dataset)))
-        #print(errD_real)
+        # print(errD_real)
 
         errD_real.backward()
         # calculate D_x, the probability that real data are classified
-        D_x = 1 - torch.nn.functional.softmax(output,dim=1).data[:, 0].mean()
+        D_x = 1 - torch.nn.functional.softmax(output, dim=1).data[:, 0].mean()
 
         #######
         # 2. Generated input
@@ -292,12 +294,14 @@ for epoch in range(opt.niter):
         for _idxz in range(opt.numz):
             noise.resize_(batch_size, opt.nz, 1, 1).normal_(0, 1)
             noisev = Variable(noise)
-            for _idxm in range(opt.num_mcmc):
+            _fake = netG(noisev)[0]
+            '''for _idxm in range(opt.num_mcmc):
                 idx = _idxz*opt.num_mcmc + _idxm
                 netG = netGs[idx]
                 _fake = netG(noisev)[0]
-                fakes.append(_fake)
-        fake = torch.cat(fakes)
+                fakes.append(_fake)'''
+        #fake = torch.cat(fakes)
+        fake = _fake
         output, kl = netD(fake.detach())
         labelv = Variable(torch.LongTensor(
             fake.data.shape[0]).cuda().fill_(fake_label))
@@ -305,58 +309,76 @@ for epoch in range(opt.niter):
         # errD_fake.backward()
 
         # --- the backprop for bayesian conv ---
-        errD_fake = elbo(output, labelv, kl, get_beta(epoch, len(dataset)))
+        errD_fake = elbo(output, labelv, kl, get_beta(epoch, 1))
         errD_fake.backward()
-        D_G_z1 = 1 - torch.nn.functional.softmax(output,dim=1).data[:, 0].mean()
+        D_G_z1 = 1 - \
+            torch.nn.functional.softmax(output, dim=1).data[:, 0].mean()
 
         #######
         # 3. Labeled Data Part (for semi-supervised learning)
-        for ii, (input_sup, target_sup) in enumerate(dataloader_semi):
-            input_sup, target_sup = input_sup.cuda(), target_sup.cuda()
-            break
-        input_sup_v = Variable(input_sup.cuda())
-        # convert target indicies from 0 to 9 to 1 to 10
-        target_sup_v = Variable((target_sup + 1).cuda())
-        output_sup, kl_sup = netD(input_sup_v)
-        #err_sup = criterion(output_sup, target_sup_v)
-        # --- the backprop for bayesian conv ---
-        err_sup = elbo(output_sup, target_sup_v, kl_sup,
-                       get_beta(epoch, len(dataset)))
-        err_sup.backward()
-        prec1 = accuracy(output_sup.data, target_sup + 1, topk=(1,))[0]
-        #top1.update(prec1[0], input_sup.size(0))
-        top1.update(prec1, input_sup.size(0))
-        if opt.bayes:
-            errD_prior = dprior_criterion(netD.parameters())
-            errD_prior.backward()
-            errD_noise = dnoise_criterion(netD.parameters())
-            errD_noise.backward()
-            errD = errD_real + errD_fake + err_sup + errD_prior + errD_noise
-        else:
+        if opt.semi_supervised_boost == True:
+            for ii, (input_sup, target_sup) in enumerate(dataloader_semi):
+                input_sup, target_sup = input_sup.cuda(), target_sup.cuda()
+                break
+            input_sup_v = Variable(input_sup.cuda())
+            # convert target indicies from 0 to 9 to 1 to 10
+            target_sup_v = Variable((target_sup + 1).cuda())
+            output_sup, kl_sup = netD(input_sup_v)
+            #err_sup = criterion(output_sup, target_sup_v)
+            # --- the backprop for bayesian conv ---
+            print(kl_sup*get_beta(epoch, len(dataset_partial)))
+            err_sup = elbo(output_sup, target_sup_v, kl_sup,
+                           get_beta(epoch, len(dataset_partial)))
+            err_sup.backward()
+            prec1 = accuracy(output_sup.data, target_sup + 1, topk=(1,))[0]
+            top1.update(prec1, input_sup.size(0))
+            '''if opt.bayes:
+                errD_prior = dprior_criterion(netD.parameters())
+                print(errD_prior)
+                errD_prior.backward()
+                errD_noise = dnoise_criterion(netD.parameters())
+                print(errD_noise)
+                errD_noise.backward()
+                errD = errD_real + errD_fake + err_sup + errD_prior + errD_noise
+            else:'''
             errD = errD_real + errD_fake + err_sup
-        optimizerD.step()
+            optimizerD.step()
+        else:
+            errD = errD_real + errD_fake
+            #optimizerD.step()
 
         # 4. Generator
-        for netG in netGs:
-            netG.zero_grad()
+        '''for netG in netGs:
+            netG.zero_grad()'''
+        netG.zero_grad()
         labelv = Variable(torch.LongTensor(
             fake.data.shape[0]).cuda().fill_(real_label))
         output, kl = netD(fake)
         #errG = criterion_comp(output)
-        #print(labelv) #the out put is all 1, not sure why in the original code they put it in a float tensor.
-        errG = elbo(output, labelv, kl, get_beta(epoch, len(dataset)))
-        if opt.bayes:
+        # print(labelv) #the out put is all 1, not sure why in the original code they put it in a float tensor.
+        errG = elbo(output, labelv, kl, get_beta(epoch, 1))
+        '''if opt.bayes:
             for netG in netGs:
                 errG += gprior_criterion(netG.parameters())
-                errG += gnoise_criterion(netG.parameters())
+                errG += gnoise_criterion(netG.parameters())'''
         errG.backward()
-        D_G_z2 = 1 - torch.nn.functional.softmax(output,1).data[:, 0].mean()
-        for optimizerG in optimizerGs:
-            optimizerG.step()
+        D_G_z2 = 1 - torch.nn.functional.softmax(output, 1).data[:, 0].mean()
+        optimizerG.step()
+        '''for optimizerG in optimizerGs:
+            optimizerG.step()'''
 
         # 5. Fully supervised training (running in parallel for comparison)
         netD_fullsup.zero_grad()
-        input_fullsup = Variable(input_sup)
+        try:
+            input_fullsup = Variable(input_sup)
+        except NameError as e:
+            #print(e, '*** Not Defined!!!!! *** draw a new one from the deck')
+            for ii, (input_sup, target_sup) in enumerate(dataloader_semi):
+                input_sup, target_sup = input_sup.cuda(), target_sup.cuda()
+                #print(input_sup)
+                break
+        finally:
+            input_fullsup = Variable(input_sup)
         target_fullsup = Variable((target_sup + 1))
         output_fullsup, kl_fullsup = netD_fullsup(input_fullsup)
         #err_fullsup = criterion_fullsup(output_fullsup, target_fullsup)
@@ -367,19 +389,22 @@ for epoch in range(opt.niter):
         optimizerD_fullsup.zero_grad()
         err_fullsup.backward()
         optimizerD_fullsup.step()
+        errD += err_fullsup
+        if opt.semi_supervised_boost == False:
+            optimizerD.step()
 
         # 6. get test accuracy after every interval
         if iteration % opt.stats_interval == 0:
             # get test accuracy on train and test
             netD.eval()
-            get_test_accuracy(netD, iteration, label='semi')
+            if opt.semi_supervised_boost == True:
+                get_test_accuracy(netD, iteration, label='semi')
             get_test_accuracy(netD_fullsup, iteration, label='sup')
             netD.train()
 
         # 7. Report for this iteration
         cur_val, ave_val = top1.val, top1.avg
         log_value('train_acc', top1.avg, iteration)
-        #print('[%d/%d][%d/%d] Loss_D: %.2f Loss_G: %.2f D(x): %.2f D(G(z)): %.2f / %.2f | Acc %.1f / %.1f' % (epoch, opt.niter, i, len(dataloader),errD.data[0], errG.data[0], D_x, D_G_z1, D_G_z2, cur_val, ave_val))
         print('[%d/%d][%d/%d] Loss_D: %.2f Loss_G: %.2f D(x): %.2f D(G(z)): %.2f / %.2f | Acc %.1f / %.1f'
               % (epoch, opt.niter, i, len(dataloader),
                  errD.data, errG.data, D_x, D_G_z1, D_G_z2, cur_val, ave_val))
@@ -388,17 +413,22 @@ for epoch in range(opt.niter):
                       '%s/real_samples.png' % opt.outf,
                       normalize=True)
     for _zid in range(opt.numz):
-        for _mid in range(opt.num_mcmc):
+        fake = netG(fixed_noise)[0]
+        vutils.save_image(fake.data, '%s/fake_samples_epoch_%03d_G_z%02d.png' %
+                          (opt.outf, epoch, _zid,), normalize=True)
+        '''for _mid in range(opt.num_mcmc):
             idx = _zid*opt.num_mcmc + _mid
             netG = netGs[idx]
             fake = netG(fixed_noise)[0]
             vutils.save_image(fake.data,
                               '%s/fake_samples_epoch_%03d_G_z%02d_m%02d.png' % (
                                   opt.outf, epoch, _zid, _mid),
-                              normalize=True)
-    for ii, netG in enumerate(netGs):
+                              normalize=True)'''
+    '''for ii, netG in enumerate(netGs):
         torch.save(netG.state_dict(), '%s/netG%d_epoch_%d.pth' %
-                   (opt.outf, ii, epoch))
+                   (opt.outf, ii, epoch))'''
+    torch.save(netG.state_dict(), '%s/netG_epoch_%d.pth' %
+               (opt.outf, epoch))
     torch.save(netD.state_dict(), '%s/netD_epoch_%d.pth' % (opt.outf, epoch))
     torch.save(netD_fullsup.state_dict(),
                '%s/netD_fullsup_epoch_%d.pth' % (opt.outf, epoch))
